@@ -1,0 +1,73 @@
+name: Build MissionControl for FW 23
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: 检出代码（含子模块与 tag）
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: 把 Atmosphere-libs 升到最新 master（关键：适配 AMS 1.12.0）
+        run: |
+          git config --global --add safe.directory '*'
+          git -C lib/Atmosphere-libs fetch --all --tags --force
+          git -C lib/Atmosphere-libs reset --hard origin/master
+          echo "Atmosphere-libs = $(git -C lib/Atmosphere-libs rev-parse --short HEAD)"
+
+      - name: 确保存在 tag（否则 make 生成的版本号为空会编译报错）
+        run: |
+          if ! git describe --tags >/dev/null 2>&1; then
+            git tag -f v0.15.2 "$(git rev-parse HEAD)"
+          fi
+          git describe --tags
+
+      - name: 编译
+        id: build
+        continue-on-error: true
+        run: make -j"$(nproc)"
+
+      - name: 若失败则把 libnx 升到 master 后重试
+        if: steps.build.outcome == 'failure'
+        run: |
+          git -C lib/libnx fetch --all --tags --force
+          git -C lib/libnx reset --hard origin/master
+          make -C lib/libnx -j"$(nproc)"
+          make -C lib/libnx install
+          make -j"$(nproc)"
+
+      - name: 组装 SD 卡目录结构
+        run: |
+          set -e
+          NSP="$(find mc_mitm/out -name '*.nsp' | head -1)"
+          test -n "$NSP"
+          echo "NSP = $NSP"
+          rm -rf dist
+          mkdir -p dist/atmosphere/contents/010000000000bd00/flags
+          cp "$NSP" dist/atmosphere/contents/010000000000bd00/exefs.nsp
+          printf 'btdrv\nbtm\n' > dist/atmosphere/contents/010000000000bd00/mitm.lst
+          touch dist/atmosphere/contents/010000000000bd00/flags/boot2.flag
+          cp mc_mitm/toolbox.json dist/atmosphere/contents/010000000000bd00/toolbox.json
+          cp -r exefs_patches dist/atmosphere/
+          mkdir -p dist/config/MissionControl/controllers
+          cp mc_mitm/config.ini dist/config/MissionControl/missioncontrol.ini.template
+          find dist -type f | sort
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: MissionControl-sdcard
+          path: dist/
+          if-no-files-found: error
