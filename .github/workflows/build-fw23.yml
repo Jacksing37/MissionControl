@@ -20,12 +20,20 @@ jobs:
           submodules: recursive
           fetch-depth: 0
 
-      - name: 把 Atmosphere-libs 升到最新 master（关键：适配 AMS 1.12.0）
+      - name: 升 Atmosphere-libs 到最新 master（适配 AMS 1.12.0 的关键）
         run: |
           git config --global --add safe.directory '*'
           git -C lib/Atmosphere-libs fetch --all --tags --force
           git -C lib/Atmosphere-libs reset --hard origin/master
           echo "Atmosphere-libs = $(git -C lib/Atmosphere-libs rev-parse --short HEAD)"
+
+      - name: 升 libnx 到 master 并安装（容器自带的太旧，缺 pgl ShellEvent 接口）
+        run: |
+          git -C lib/libnx fetch --all --tags --force
+          git -C lib/libnx reset --hard origin/master
+          echo "libnx = $(git -C lib/libnx rev-parse --short HEAD)"
+          make -C lib/libnx -j"$(nproc)"
+          make -C lib/libnx install
 
       - name: 确保存在 tag（否则 make 生成的版本号为空会编译报错）
         run: |
@@ -34,19 +42,101 @@ jobs:
           fi
           git describe --tags
 
+      - name: 兼容性补丁（新版 libnx 移除的 btm 类型，按原布局补回）
+        run: |
+          cat > mc_mitm/source/btm_mitm/btm/btm_compat.h <<'EOF'
+          #pragma once
+          #include <switch.h>
+          /* 兼容层：以下类型在较新的 libnx 中被移除或改名
+           *   BtmDeviceConditionV100/V510/V800/V900 -> BtmDeviceConditionListV100/V510/V800/V900
+           *   BtmConnectedDeviceV13 -> BtmDeviceCondition
+           *   BtmConnectedDeviceV1  -> BtmDeviceConditionLegacy
+           *   BtmDeviceInfoV13      -> BtmDeviceInfo
+           * 按 MissionControl 原本对应的 libnx 提交(dbcc1bea)原样补回，保证 IPC 载荷布局不变。 */
+          typedef struct {
+              BtdrvAddress address;
+              u8 pad[2];
+              u32 unk_x8;
+              char name[0x20];
+              u8 unk_x2C[0x1C];
+              u16 vid;
+              u16 pid;
+              u8 unk_x4C[0x20];
+          } BtmConnectedDeviceV1;
+          typedef struct {
+              BtdrvAddress address;
+              u8 pad[2];
+              u32 profile;
+              u8 unk_xC[0x40];
+              char name[0x20];
+              u8 unk_x6C[0xD9];
+              u8 pad2[3];
+          } BtmConnectedDeviceV13;
+          typedef struct {
+              u32 unk_x0;
+              u32 unk_x4;
+              u8 unk_x8;
+              u8 unk_x9;
+              u8 max_count;
+              u8 connected_count;
+              BtmConnectedDeviceV1 devices[8];
+          } BtmDeviceConditionV100;
+          typedef struct {
+              u32 unk_x0;
+              u32 unk_x4;
+              u8 unk_x8;
+              u8 unk_x9[2];
+              u8 max_count;
+              u8 connected_count;
+              u8 pad[3];
+              BtmConnectedDeviceV1 devices[8];
+          } BtmDeviceConditionV510;
+          typedef struct {
+              u32 unk_x0;
+              u32 unk_x4;
+              u8 unk_x8;
+              u8 unk_x9;
+              u8 max_count;
+              u8 connected_count;
+              BtmConnectedDeviceV1 devices[8];
+          } BtmDeviceConditionV800;
+          typedef struct {
+              u32 unk_x0;
+              u8 unk_x4;
+              u8 unk_x5;
+              u8 max_count;
+              u8 connected_count;
+              BtmConnectedDeviceV1 devices[8];
+          } BtmDeviceConditionV900;
+          typedef struct {
+              BtdrvAddress addr;
+              BtmClassOfDevice class_of_device;
+              BtmLinkKey link_key;
+              u8 reserved[3];
+              u32 profile;
+              union {
+                  u8 data[0x4];
+                  BtmHidDeviceInfo hid_device_info;
+              } profile_info;
+              u8 reserved2[0x1C];
+              char name[0xF9];
+              u8 pad[3];
+          } BtmDeviceInfoV13;
+          EOF
+          sed -i 's|#include <switch.h>|#include <switch.h>\n#include "btm/btm_compat.h"|' mc_mitm/source/btm_mitm/btm_shim.h
+          sed -i 's|#include <switch.h>|#include <switch.h>\n#include "btm_compat.h"|' mc_mitm/source/btm_mitm/btm/btm_types.hpp
+          echo "--- btm_shim.h 头部 ---"; head -20 mc_mitm/source/btm_mitm/btm_shim.h
+          echo "--- btm_types.hpp 头部 ---"; head -22 mc_mitm/source/btm_mitm/btm/btm_types.hpp
+
       - name: 编译
         id: build
         continue-on-error: true
         run: make -j"$(nproc)"
 
-      - name: 若失败则把 libnx 升到 master 后重试
+      - name: 如果还失败，再列一次关键错误
         if: steps.build.outcome == 'failure'
         run: |
-          git -C lib/libnx fetch --all --tags --force
-          git -C lib/libnx reset --hard origin/master
-          make -C lib/libnx -j"$(nproc)"
-          make -C lib/libnx install
-          make -j"$(nproc)"
+          echo "==== 仍存在错误，以下为编译输出尾部 ===="
 
       - name: 组装 SD 卡目录结构
         run: |
